@@ -1,0 +1,108 @@
+import { promises as fsp } from 'node:fs';
+import path from 'node:path';
+
+/**
+ * CelesTrak TLE proxy handler. Shared verbatim between the Vite dev-server
+ * plugin (vite.config.js: celestrakProxy) and the Vercel Function entrypoint
+ * (api/celestrak.js) — see docs/CURRENT-STATE.md "Proxy/Security Baseline".
+ *
+ * Disk caching to `.gev-cache/` is a best-effort optimization: on Vercel the
+ * function filesystem is read-only outside `/tmp`, so writeDisk's existing
+ * try/catch simply logs and continues, serving from the in-memory cache for
+ * the life of the warm instance instead. No environment-specific branching
+ * needed — this was already resilient to a missing/read-only cache dir.
+ */
+const TLE_TTL_MS = 6 * 3600_000;
+const CACHE_DIR = path.join(process.cwd(), '.gev-cache');
+const mem = new Map(); // group -> { at: epochMs, body: string }
+const inflight = new Map(); // group -> Promise<{at, body}|null>
+
+const diskPath = (group) => path.join(CACHE_DIR, `celestrak-${group}.json`);
+
+async function readDisk(group) {
+  try {
+    const parsed = JSON.parse(await fsp.readFile(diskPath(group), 'utf8'));
+    if (typeof parsed?.body === 'string' && Number.isFinite(parsed?.at)) return parsed;
+  } catch { /* no disk cache yet */ }
+  return null;
+}
+
+async function writeDisk(group, entry) {
+  try {
+    await fsp.mkdir(CACHE_DIR, { recursive: true });
+    await fsp.writeFile(diskPath(group), JSON.stringify(entry), 'utf8');
+  } catch (err) {
+    console.warn(`[celestrak-proxy] cache write failed for ${group}:`, err?.message || err);
+  }
+}
+
+async function fetchUpstream(group) {
+  const url = new URL('https://celestrak.org/NORAD/elements/gp.php');
+  url.searchParams.set('GROUP', group);
+  url.searchParams.set('FORMAT', 'tle');
+  const res = await fetch(url.toString(), {
+    signal: AbortSignal.timeout(20000),
+    // CelesTrak 403s bulk groups (e.g. `active`) unless the request carries a
+    // descriptive User-Agent with a contact point.
+    headers: { 'User-Agent': 'gods-eye-view-celestrak-proxy/1.0 (+https://github.com/bilawalsidhu/gods-eye-view)' },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const body = await res.text();
+  // An upstream error page parses to zero TLEs — treat as failure, keep cache.
+  if (!/^1 /m.test(body)) throw new Error('no TLE lines in response');
+  return { at: Date.now(), body };
+}
+
+/** @param {import('http').IncomingMessage} req @param {import('http').ServerResponse} res */
+export default async function celestrakHandler(req, res) {
+  const group = String(req.url || '').replace(/^\//, '').split('?')[0];
+  if (!/^[a-z0-9-]+$/i.test(group)) {
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.end('invalid group');
+    return;
+  }
+  const send = (status, body, cacheStatus) => {
+    // Guard against a double-send (e.g. a throw AFTER a response already
+    // went out routing into the catch's send): writeHead after headersSent
+    // throws "Cannot set headers after they are sent".
+    if (res.headersSent) return;
+    res.writeHead(status, { 'Content-Type': 'text/plain', 'x-tle-cache': cacheStatus });
+    res.end(body);
+  };
+  try {
+    const now = Date.now();
+    let entry = mem.get(group);
+    if (!entry) {
+      entry = await readDisk(group);
+      if (entry) mem.set(group, entry);
+    }
+    if (entry && now - entry.at < TLE_TTL_MS) {
+      send(200, entry.body, 'HIT');
+      return;
+    }
+    // Stale or missing → refresh, single-flight per group.
+    if (!inflight.has(group)) {
+      inflight.set(group, fetchUpstream(group)
+        .then(async (fresh) => {
+          mem.set(group, fresh);
+          await writeDisk(group, fresh);
+          return fresh;
+        })
+        .catch((err) => {
+          console.warn(`[celestrak-proxy] ${group} refresh failed (${err?.message || err}) — serving cache if any`);
+          return null;
+        })
+        .finally(() => inflight.delete(group)));
+    }
+    const fresh = await inflight.get(group);
+    if (fresh) {
+      send(200, fresh.body, 'MISS');
+    } else if (entry) {
+      send(200, entry.body, 'STALE-ERROR'); // upstream down — stale beats empty
+    } else {
+      send(502, 'celestrak fetch failed and no cache available', 'NONE');
+    }
+  } catch (err) {
+    send(500, `celestrak proxy error: ${err?.message || err}`, 'ERROR');
+  }
+}

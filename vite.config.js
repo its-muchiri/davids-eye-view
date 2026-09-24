@@ -67,14 +67,9 @@ import {
   validateKeySetupUpdates,
 } from './src/keySetupCore.mjs';
 import { hardenCredentialFile } from './src/keySetupHardening.mjs';
-import {
-  fetchTerrainChunkWithRetry,
-  parseTerrainPoints,
-  resolveTerrainHeightRequest,
-  terrainPointKey,
-  validTerrainResult,
-} from './src/data/terrainHeightsProxy.js';
 import { VOICE_MODELS, isKnownVoiceTier, resolveVoiceModel } from './src/voice/voiceCost.js';
+import celestrakHandler from './api/_lib/celestrak.js';
+import terrainHeightsHandler from './api/_lib/terrainHeights.js';
 
 /** Resolve __dirname for ESM context. */
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1543,102 +1538,12 @@ function buildOpenSkyHeaders({ cacheStatus, requestedMode, usedMode, reason, sta
  * cache+serve-stale. Adapted from skylight's TleStore (MIT).
  */
 function celestrakProxy() {
-  const TLE_TTL_MS = 6 * 3600_000;
-  const CACHE_DIR = path.join(process.cwd(), '.gev-cache');
-  const mem = new Map(); // group -> { at: epochMs, body: string }
-  const inflight = new Map(); // group -> Promise<{at, body}|null>
-
-  const diskPath = (group) => path.join(CACHE_DIR, `celestrak-${group}.json`);
-
-  async function readDisk(group) {
-    try {
-      const parsed = JSON.parse(await fsp.readFile(diskPath(group), 'utf8'));
-      if (typeof parsed?.body === 'string' && Number.isFinite(parsed?.at)) return parsed;
-    } catch { /* no disk cache yet */ }
-    return null;
-  }
-
-  async function writeDisk(group, entry) {
-    try {
-      await fsp.mkdir(CACHE_DIR, { recursive: true });
-      await fsp.writeFile(diskPath(group), JSON.stringify(entry), 'utf8');
-    } catch (err) {
-      console.warn(`[celestrak-proxy] cache write failed for ${group}:`, err?.message || err);
-    }
-  }
-
-  async function fetchUpstream(group) {
-    const url = new URL('https://celestrak.org/NORAD/elements/gp.php');
-    url.searchParams.set('GROUP', group);
-    url.searchParams.set('FORMAT', 'tle');
-    const res = await fetch(url.toString(), {
-      signal: AbortSignal.timeout(20000),
-      // CelesTrak 403s bulk groups (e.g. `active`) unless the request carries a
-      // descriptive User-Agent with a contact point.
-      headers: { 'User-Agent': 'gods-eye-view-celestrak-proxy/1.0 (+https://github.com/bilawalsidhu/gods-eye-view)' },
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const body = await res.text();
-    // An upstream error page parses to zero TLEs — treat as failure, keep cache.
-    if (!/^1 /m.test(body)) throw new Error('no TLE lines in response');
-    return { at: Date.now(), body };
-  }
-
+  // Handler lives in api/_lib/celestrak.js so it's shared byte-for-byte with
+  // the Vercel Function entrypoint at api/celestrak.js (see docs/CURRENT-STATE.md).
   return {
     name: 'celestrak-proxy',
     configureServer(server) {
-      server.middlewares.use('/api/celestrak', async (req, res) => {
-        const group = String(req.url || '').replace(/^\//, '').split('?')[0];
-        if (!/^[a-z0-9-]+$/i.test(group)) {
-          res.writeHead(400, { 'Content-Type': 'text/plain' });
-          res.end('invalid group');
-          return;
-        }
-        const send = (status, body, cacheStatus) => {
-          // Guard against a double-send (e.g. a throw AFTER a response already
-          // went out routing into the catch's send): writeHead after headersSent
-          // throws "Cannot set headers after they are sent".
-          if (res.headersSent) return;
-          res.writeHead(status, { 'Content-Type': 'text/plain', 'x-tle-cache': cacheStatus });
-          res.end(body);
-        };
-        try {
-          const now = Date.now();
-          let entry = mem.get(group);
-          if (!entry) {
-            entry = await readDisk(group);
-            if (entry) mem.set(group, entry);
-          }
-          if (entry && now - entry.at < TLE_TTL_MS) {
-            send(200, entry.body, 'HIT');
-            return;
-          }
-          // Stale or missing → refresh, single-flight per group.
-          if (!inflight.has(group)) {
-            inflight.set(group, fetchUpstream(group)
-              .then(async (fresh) => {
-                mem.set(group, fresh);
-                await writeDisk(group, fresh);
-                return fresh;
-              })
-              .catch((err) => {
-                console.warn(`[celestrak-proxy] ${group} refresh failed (${err?.message || err}) — serving cache if any`);
-                return null;
-              })
-              .finally(() => inflight.delete(group)));
-          }
-          const fresh = await inflight.get(group);
-          if (fresh) {
-            send(200, fresh.body, 'MISS');
-          } else if (entry) {
-            send(200, entry.body, 'STALE-ERROR'); // upstream down — stale beats empty
-          } else {
-            send(502, 'celestrak fetch failed and no cache available', 'NONE');
-          }
-        } catch (err) {
-          send(500, `celestrak proxy error: ${err?.message || err}`, 'ERROR');
-        }
-      });
+      server.middlewares.use('/api/celestrak', celestrakHandler);
     },
   };
 }
@@ -2231,142 +2136,12 @@ function firmsProxy() {
  * request order. Oversized requests (>256 points) are chunked sequentially.
  */
 function terrainHeightsProxy() {
-  const TTL_MS = 30 * 24 * 3600_000;
-  const CACHE_DIR = path.join(process.cwd(), '.gev-cache');
-  const CACHE_PATH = path.join(CACHE_DIR, 'terrain-heights.json');
-  const UPSTREAM_CHUNK = 256;
-  const MAX_POINTS = 2000;
-
-  /** @type {Map<string, {at:number, result:object}>} keyed by canonical 5dp lon/lat. */
-  const mem = new Map();
-  /** @type {Map<string, Promise<Array<object>>>} single-flight per missing-point subset. */
-  const inflight = new Map();
-  let diskLoaded = false;
-  let diskDirty = false;
-
-  /** Load the on-disk cache into memory once, lazily (first request only). */
-  async function loadDiskOnce() {
-    if (diskLoaded) return;
-    diskLoaded = true;
-    try {
-      const parsed = JSON.parse(await fsp.readFile(CACHE_PATH, 'utf8'));
-      const pointEntries = parsed?.version === 2 && parsed.points && typeof parsed.points === 'object'
-        ? parsed.points
-        : null;
-      if (pointEntries) {
-        for (const [key, entry] of Object.entries(pointEntries)) {
-          if (entry && Number.isFinite(entry.at) && validTerrainResult(entry.result)) {
-            mem.set(key, entry);
-          }
-        }
-      } else if (parsed && typeof parsed === 'object') {
-        // One-time migration from the former raw-batch cache. Zip only real,
-        // positionally present results; an absent value never becomes height 0.
-        for (const [rawPoints, entry] of Object.entries(parsed)) {
-          const points = parseTerrainPoints(rawPoints);
-          if (!points || !entry || !Number.isFinite(entry.at) || !Array.isArray(entry.results)) continue;
-          for (let i = 0; i < points.length; i += 1) {
-            const result = entry.results[i];
-            if (!validTerrainResult(result)) continue;
-            const key = terrainPointKey(points[i]);
-            const existing = mem.get(key);
-            if (!existing || entry.at > existing.at) mem.set(key, { at: entry.at, result });
-          }
-        }
-        diskDirty = mem.size > 0;
-      }
-    } catch { /* no disk cache yet */ }
-    // Periodic flush, same shape as adsbdbProxy: coalesce writes instead of
-    // hitting disk on every request.
-    setInterval(async () => {
-      if (!diskDirty) return;
-      diskDirty = false;
-      try {
-        await fsp.mkdir(CACHE_DIR, { recursive: true });
-        const obj = { version: 2, points: Object.fromEntries(mem.entries()) };
-        await fsp.writeFile(CACHE_PATH, JSON.stringify(obj), 'utf8');
-      } catch (err) {
-        diskDirty = true; // retry next tick
-        console.warn('[terrain-heights-proxy] cache write failed:', err?.message || err);
-      }
-    }, 15_000).unref?.();
-  }
-
-  /**
-   * Fetch all missing chunks sequentially (upstream caps each call at 256).
-   *
-   * The first try keeps its empirically required 30s timeout; network errors,
-   * 429, and 5xx receive up to three jittered retries sharing a 10s added-time
-   * budget, with Retry-After honored within that bound.
-   * @param {Array<[number, number]>} points
-   * @returns {Promise<Array<object>>}
-   */
-  async function fetchUpstreamAll(points) {
-    const results = [];
-    for (let i = 0; i < points.length; i += UPSTREAM_CHUNK) {
-      const chunk = points.slice(i, i + UPSTREAM_CHUNK);
-      const chunkResults = await fetchTerrainChunkWithRetry(chunk);
-      // Keep later chunks aligned even if a malformed upstream response omits
-      // trailing positions. The resolver will reject each null individually.
-      for (let j = 0; j < chunk.length; j += 1) results.push(chunkResults[j] ?? null);
-    }
-    return results;
-  }
-
-  /** Coalesce concurrent requests for the same canonical missing-point list. */
-  function fetchMissingSingleFlight(points) {
-    const key = points.map(terrainPointKey).join(';');
-    if (!inflight.has(key)) {
-      const request = fetchUpstreamAll(points)
-        .finally(() => {
-          if (inflight.get(key) === request) inflight.delete(key);
-        });
-      inflight.set(key, request);
-    }
-    return inflight.get(key);
-  }
-
+  // Handler lives in api/_lib/terrainHeights.js so it's shared byte-for-byte
+  // with the Vercel Function entrypoint at api/terrain/heights.js.
   return {
     name: 'terrain-heights-proxy',
     configureServer(server) {
-      server.middlewares.use('/api/terrain/heights', async (req, res) => {
-        const send = (status, bodyObj) => {
-          if (res.headersSent) return;
-          res.writeHead(status, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(bodyObj));
-        };
-        try {
-          await loadDiskOnce();
-          const parsedUrl = new URL(req.url || '', 'http://internal');
-          const rawPoints = parsedUrl.searchParams.get('points');
-          const points = parseTerrainPoints(rawPoints);
-          if (!points) {
-            send(400, { error: 'invalid points parameter — expected "lon,lat;lon,lat;…" with finite numbers' });
-            return;
-          }
-          if (points.length > MAX_POINTS) {
-            send(500, { error: `too many points (${points.length}); max ${MAX_POINTS} per request` });
-            return;
-          }
-
-          const outcome = await resolveTerrainHeightRequest({
-            points,
-            cache: mem,
-            fetchMissing: fetchMissingSingleFlight,
-            ttlMs: TTL_MS,
-          });
-          if (outcome.cacheChanged) diskDirty = true;
-          if (outcome.upstreamError) {
-            console.warn(
-              `[terrain-heights-proxy] refresh incomplete (${outcome.upstreamError?.message || outcome.upstreamError})`
-              + ' — serving stale points when available'
-            );
-          }
-          send(outcome.status, outcome.body);
-        } catch (err) {
-          send(500, { error: `terrain heights proxy error: ${err?.message || err}` });
-        }
-      });
+      server.middlewares.use('/api/terrain/heights', terrainHeightsHandler);
     },
   };
 }
